@@ -137,7 +137,7 @@ if __name__ == '__main__':
         print(f'Train loss: {train_loss:.4f}, Test loss: {test_loss:.4f}, Test accuracy: {test_acc:.4f}')
 
     # Save the model
-    torch.save(model.state_dict(), './greesyguard.safetensors')
+    torch.save(model.state_dict(), './greesyguard.pth')
 
     def classify_text_with_score(text):
         model.eval()
