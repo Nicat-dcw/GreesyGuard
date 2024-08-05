@@ -13,7 +13,7 @@
 
 ## About
 
-GreesyGuard is a text moderation model trained on **Gitpod** to identify and filter inappropriate content.
+GreesyGuard is a text moderation model trained on **Gitpod** to identify and filter inappropriate content. GreesyGuard created with the help of `claude-3.5-sonnet`
 
 ## Installation Steps
 
