@@ -29,7 +29,7 @@ def classify_text(text):
 
 app = FastAPI(title="OpenAI-compatible API")
 class Moderations(BaseModel):
-    model: str = "greesyguard-2-1m",
+    model: str = "greesyguard-2-0805",
     input: str = "",
     beta: bool
 @app.post("/v1/moderations")
