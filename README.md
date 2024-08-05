@@ -10,18 +10,19 @@
 2. Install the required packages:
 
     ```sh
-    pip install torch scikit-learn tqdm tiktoken
+    pip install -r requirements.txt
     ```
 
-3. Ensure you have your dataset prepared in a JSON file (e.g., `data.json`), where each entry is a dictionary with `text` and `label` fields.
+3. Ensure your dataset have fields `tweet` and `label`>.
 
-4. Run the script:
+4. Run the script (train):
 
     ```sh
-    python main.py
+    python train.py
     ```
+ - Run The Script (inference):
+   ```sh
+   python inference.py
+   ```
 
-
-> Example for Dataset: `./data.json`
-
-> Note: Next 20 Stars new update will come
+> Next version: 10 stars
