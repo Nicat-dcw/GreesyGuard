@@ -47,6 +47,13 @@ GreesyGuard is a text moderation model trained on **Gitpod** to identify and fil
     ```
 
 ---
+## Benchmark
+> We used the dataset for training the model for benchmark
+| | HumanEval | SG Prompt |
+|----------|----------|----------|
+| GreesyGuard-2    | 42%    | 89.7 |
+| Text-mod-007    | 16%   | 85.6|
+| ShieldGemma(2b)   | No Data   | No Data|
 
 ## Changes in this version
 - Increased Vocab size
