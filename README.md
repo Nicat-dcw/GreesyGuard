@@ -1,27 +1,69 @@
-# Installation Steps
 
-1. Clone the repository:
+
+# GreesyGuard 
+
+<div align="center">
+  <a href="https://www.gitpod.io#gh-light-mode-only">
+    <img src="https://github.com/gitpod-io/gitpod/assets/55068936/01a00b23-e1f5-4650-a629-89db8e300708" style="width: 256px;">
+  </a>
+  <a href="https://www.gitpod.io#gh-dark-mode-only">
+    <img src="https://github.com/gitpod-io/gitpod/assets/55068936/ff437ec6-adda-4814-9e92-fff44cfd00ad" style="width: 256px;">
+  </a>
+</div>
+
+## About
+
+GreesyGuard is a text moderation model trained on **Gitpod** to identify and filter inappropriate content. GreesyGuard created with the help of `claude-3.5-sonnet`
+
+## Installation Steps
+
+1. **Clone the repository:**
 
     ```sh
-    git clone Nicat-dcw/greesyguard.git
+    git clone https://github.com/Nicat-dcw/greesyguard.git
     cd greesyguard
     ```
 
-2. Install the required packages:
+2. **Install the required packages:**
 
     ```sh
-    pip install torch scikit-learn tqdm tiktoken
+    pip install -r requirements.txt
     ```
 
-3. Ensure you have your dataset prepared in a JSON file (e.g., `data.json`), where each entry is a dictionary with `text` and `label` fields.
+3. **Prepare your dataset:**
 
-4. Run the script:
+    Ensure your dataset contains fields `tweet` and `label`.
+
+4. **Train the model:**
 
     ```sh
-    python main.py
+    python train.py
     ```
 
+5. **Run inference:**
 
-> Example for Dataset: `./data.json`
+    ```sh
+    python inference.py
+    ```
 
-> Note: Next 20 Stars new update will come
+---
+## Benchmark
+> We used the dataset for training the model for benchmark
+
+| | HumanEval | SG Prompt |
+|----------|----------|----------|
+| GreesyGuard-2    | 42%    | 89.7 |
+| Text-mod-007    | 16%   | 85.6|
+| ShieldGemma(2b)   | No Data   | No Data|
+
+## Changes in this version
+- Increased Vocab size
+- Tokenizer (p50>cl100k)
+- Max length (128>2048)
+- Learning rate (2e-5)
+- Hugginface's datasets support
+- Better learning handling
+- API Support (OpenAI)
+
+Next version: 10 stars
+
