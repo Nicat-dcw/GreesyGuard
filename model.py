@@ -1,16 +1,16 @@
-import torch
+mport torch
 from torch import nn
-from huggingface_hub import PyTorchModelHubMixin
-class GreesyGuard(nn.Module,PyTorchModelHubMixin):
-    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim):
+
+class GreesyGuard(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_categories):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.relu = nn.ReLU()
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.classifier = nn.Linear(hidden_dim * 2, num_categories)
 
     def forward(self, x):
         embedded = self.embedding(x)
-        pooled = torch.mean(embedded, dim=1)
-        hidden = self.relu(self.fc1(pooled))
-        return self.fc2(hidden)
+        lstm_out, _ = self.lstm(embedded)
+        pooled = torch.mean(lstm_out, dim=1)
+        category_scores = self.classifier(pooled)
+        return category_scores
