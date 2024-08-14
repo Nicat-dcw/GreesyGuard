@@ -1,98 +1,114 @@
 import torch
-from torch import nn
+from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 import tiktoken
 from model import GreesyGuard
-# Load the dataset
-dataset = load_dataset("badmatr11x/hate-offensive-speech")
+from tqdm import tqdm
+from collections import Counter
 
-
-# Initialize tokenizer
-tokenizer = tiktoken.get_encoding("cl100k_base")
-
-# Custom dataset class
-class HateSpeechDataset(Dataset):
-    def __init__(self, data, tokenizer, max_length=2048):
-        self.data = data
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, label_to_id, tokenizer, max_length=2048):
+        self.texts = texts
+        self.labels = labels
+        self.label_to_id = label_to_id
         self.tokenizer = tokenizer
         self.max_length = max_length
 
     def __len__(self):
-        return len(self.data)
+        return len(self.texts)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        tokens = self.tokenizer.encode(item['tweet'])[:self.max_length]
-        if len(tokens) < self.max_length:
-            tokens += [0] * (self.max_length - len(tokens))
-        return {
-            'input_ids': torch.tensor(tokens, dtype=torch.long),
-            'label': torch.tensor(item['label'], dtype=torch.long)
-        }
+        text = self.texts[idx]
+        label = self.label_to_id[self.labels[idx]]
+        tokens = self.tokenizer.encode(text)[:self.max_length]
+        tokens = tokens + [0] * (self.max_length - len(tokens))  # Padding
+        return torch.tensor(tokens), torch.tensor(label, dtype=torch.long)
 
-# Prepare datasets
-train_dataset = HateSpeechDataset(dataset['train'], tokenizer)
-test_dataset = HateSpeechDataset(dataset['test'], tokenizer)
-
-# DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32)
-
-# Initialize model
-conf = { "vocab_size": 150000, "embed_dim":128, "hidden_dim":64, "output_dim":3}
-model = GreesyGuard(vocab_size=150000, embed_dim=128, hidden_dim=64, output_dim=3)
-
-# Training setup
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
-
-# Training loop
-num_epochs = 5
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-for epoch in range(num_epochs):
-    model.train()
-    train_loss = 0
-    for batch in train_loader:
-        input_ids = batch['input_ids'].to(device)
-        labels = batch['label'].to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(input_ids)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        train_loss += loss.item()
-    
-    # Evaluation
-    model.eval()
-    correct = 0
-    total = 0
-    test_loss = 0
-    with torch.no_grad():
-        for batch in test_loader:
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['label'].to(device)
+def train(model, train_loader, criterion, optimizer, num_epochs, device):
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            inputs, labels = batch
+            inputs, labels = inputs.to(device), labels.to(device)
             
-            outputs = model(input_ids)
-            loss = criterion(outputs, labels)
-            test_loss += loss.item()
+            optimizer.zero_grad()
+            category_scores = model(inputs)
+            loss = criterion(category_scores, labels)
+            loss.backward()
+            optimizer.step()
             
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f'Total Params:{total_params}')
-    print(f'Epoch {epoch+1}/{num_epochs}')
-    print(f'Train Loss: {train_loss/len(train_loader):.4f}')
-    print(f'Test Loss: {test_loss/len(test_loader):.4f}')
-    print(f'Test Accuracy: {100 * correct / total:.2f}%')
-    print('---')
+            total_loss += loss.item()
+        
+        print(f"Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}")
+        
+   
 
-# Save the model
-torch.save(model.state_dict(), 'model.bin')
-model.push_to_hub("greesyguard")
-print("Model saved successfully!")
+
+
+
+
+
+
+
+
+        
+
+
+    return model
+
+def main():
+    # Load dataset
+    dataset = load_dataset("OnlyCheeini/Greesyguard-2.5-mini")  # Replace with actual dataset
+    train_data = dataset['train']
+   
+
+    # Get categories from dataset
+    all_categories = train_data['category'] 
+    category_counts = Counter(all_categories)
+    categories = list(category_counts.keys())
+    label_to_id = {label: id for id, label in enumerate(categories)}
+    id_to_label = {id: label for label, id in label_to_id.items()}
+
+    print(f"Categories: {categories}")
+    print(f"Category counts: {category_counts}")
+
+    # Tokenizer
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+
+    # Prepare datasets
+    train_dataset = TextDataset(train_data['text'], train_data['category'], label_to_id, tokenizer)
+    #val_dataset = TextDataset(val_data['text'], val_data['category'], label_to_id, tokenizer)
+
+    # DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    #val_loader = DataLoader(val_dataset, batch_size=32)
+
+    # Model initialization
+    model = GreesyGuard(
+        vocab_size=150000,
+        embed_dim=256,
+        hidden_dim=128,
+        num_categories=len(categories)
+    )
+
+    # Training setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.00005)
+
+    # Train the model
+    model = train(model, train_loader, criterion, optimizer, num_epochs=5, device=device)
+
+    # Save the model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'categories': categories,
+        'label_to_id': label_to_id,
+        'id_to_label': id_to_label
+    }, 'greesyguard.pth')
+
+if __name__ == "__main__":
+    main()
