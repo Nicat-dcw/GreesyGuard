@@ -32,7 +32,7 @@ GreesyGuard is a text moderation model trained on **Gitpod** to identify and fil
 
 3. **Prepare your dataset:**
 
-    Ensure your dataset contains fields `tweet` and `label`.
+    Ensure your dataset contains fields `text` and `category`.
 
 4. **Train the model:**
 
