@@ -8,7 +8,7 @@ from tqdm import tqdm
 from collections import Counter
 
 class TextDataset(Dataset):
-    def __init__(self, texts, labels, label_to_id, tokenizer, max_length=2048):
+    def __init__(self, texts, labels, label_to_id, tokenizer, max_length=32768):
         self.texts = texts
         self.labels = labels
         self.label_to_id = label_to_id
