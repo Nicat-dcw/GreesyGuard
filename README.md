@@ -28,6 +28,17 @@ GreesyGuard is a lightweight, specialized Transformer model designed for high-pr
 | **Precision** | Autocast (BFloat16 on CUDA / Float16 on MPS) |
 
 ---
+## 🤴 leaderboard
+
+| Model           | Overall   | Flames                   | Safety                     | llm-trustworthy-leaderboard          | Legality                   | Data protection             |
+|-----------------|-----------|----------------------------|----------------------------|----------------------------|----------------------------|-----------------------------|
+| 3-mini-deep        | 77.91%    | 45.38% / 79.8              | 45.45% / 74.1              | 42.79% / 76.8              | 45.65% / 63.8              | 55.26% / 70.2               |
+| 3-mini-expert           | 70.01%    | 41.37% / 78.2              | 27.51% / 67.7              | 50.75% / 80.6              | 30.43% / 53.6              | 50.0% / 66.7                |
+| 3-mini-standart          | **63.77%**| **53.41%** / 83.4          | 28.44% / 65.5              | **77.11%** / **91.5**      | 71.74% / 81.2              | **88.16%** / **92.1**       |
+| 3-mini-flash         | 23.66%    | 24.5% / 69.9               | 18.41% / 59.6              | 27.86% / 70.5              | 30.43% / 53.6              | 17.11% / 44.7               |
+
+
+
 
 ## 🚦 Quick Start
 
