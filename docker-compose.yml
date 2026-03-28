@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  greesy:
+    build: .
+    container_name: greesy_model
+    volumes:
+      # Mount the current directory so you can edit dataset.json or model.py 
+      # without needing to rebuild the Docker image every time.
+      - .:/app
+    
+    # ---------------------------------------------------------
+    # UNCOMMENT the lines below if you have an NVIDIA GPU and
+    # the NVIDIA Container Toolkit installed on your host system.
+    # ---------------------------------------------------------
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

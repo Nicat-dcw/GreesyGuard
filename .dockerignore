@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.git/
+.idea/
+.vscode/
+# Note: DO NOT ignore dataset.json if you want it baked into the image.
+# If you plan to mount it at runtime instead, you can uncomment the next line:
+# dataset.json
