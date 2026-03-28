@@ -1,7 +1,7 @@
 
-# GreesyGPT: Reasoning-Based Content Moderation
+# GreesyGuard: Reasoning-Based Content Moderation
 
-GreesyGPT is a lightweight, specialized Transformer model designed for high-precision content moderation. Unlike traditional "black-box" classifiers, GreesyGPT utilizes **Chain-of-Thought (CoT)** reasoning to analyze intent, context, and policy violations before issuing a final verdict.
+GreesyGuard is a lightweight, specialized Transformer model designed for high-precision content moderation. Unlike traditional "black-box" classifiers, GreesyGPT utilizes **Chain-of-Thought (CoT)** reasoning to analyze intent, context, and policy violations before issuing a final verdict.
 
 ## 🚀 Key Features
 
@@ -37,7 +37,7 @@ pip install torch tiktoken tqdm
 ```
 
 ### 2. Basic Inference
-GreesyGPT uses a specific chat template to trigger reasoning.
+GreesyGuard uses a specific chat template to trigger reasoning.
 
 ```python
 from model import GreesyGPT, generate_moderation, ReasoningMode, OutputFormat
