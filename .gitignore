@@ -2,7 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+greesy_gpt.py
 # C extensions
 *.so
 #

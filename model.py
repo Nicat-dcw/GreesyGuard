@@ -1,28 +1,77 @@
-<<<<<<< HEAD
-import re
-import json
+"""
+GreesyGPT — Content-moderation language model with KV caching and dropout.
+
+Production-ready implementation featuring:
+  • KV caching for O(1) per-token inference (instead of recomputing full sequence)
+  • Configurable dropout for regularisation during training
+  • Centralised ModelConfig dataclass for all hyperparameters
+  • Structured logging via the stdlib ``logging`` module
+  • Type annotations throughout
+"""
+
+from __future__ import annotations
+
 import contextlib
+import json
+import logging
+import re
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Any, Optional, cast
+
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-import tiktoken
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from enum import Enum
-from dataclasses import dataclass
-from typing import Optional
 
 
 # ─────────────────────────────────────────────
-# Configuration
+# Logging
 # ─────────────────────────────────────────────
-VOCAB_SIZE  = 8192   # o200k_base (200019 mergeable ranks) + 7 custom specials, padded to 32
-CONTEXT_LEN = 12000    # 12k — fits comfortably in M4 Air unified memory
-N_EMBD      = 768
-N_HEAD      = 12
-N_LAYER     = 12
+logger = logging.getLogger("greesygpt")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+
+
+# ─────────────────────────────────────────────
+# Model Configuration
+# ─────────────────────────────────────────────
+@dataclass
+class ModelConfig:
+    """Centralised hyperparameter store for GreesyGPT."""
+
+    vocab_size: int = 8192
+    context_len: int = 12_000
+    n_embd: int = 768
+    n_head: int = 12
+    n_layer: int = 12
+
+    # Dropout rates (set to 0.0 at inference via model.eval(); typical training values 0.1–0.2)
+    attn_dropout: float = 0.1
+    resid_dropout: float = 0.1
+    embd_dropout: float = 0.1
+    mlp_dropout: float = 0.1
+
+    @property
+    def head_dim(self) -> int:
+        assert self.n_embd % self.n_head == 0, "n_embd must be divisible by n_head"
+        return self.n_embd // self.n_head
+
+
+# Legacy constants (kept for backward compatibility; prefer ModelConfig)
+DEFAULT_CONFIG = ModelConfig()
+VOCAB_SIZE  = DEFAULT_CONFIG.vocab_size
+CONTEXT_LEN = DEFAULT_CONFIG.context_len
+N_EMBD      = DEFAULT_CONFIG.n_embd
+N_HEAD      = DEFAULT_CONFIG.n_head
+N_LAYER     = DEFAULT_CONFIG.n_layer
 
 
 # ─────────────────────────────────────────────
@@ -264,7 +313,7 @@ _LABEL_SEVERITY: dict[str, int] = {
 }
 
 # Ordered substitutions for stripping Markdown syntax
-_MD_STRIP: list[tuple[re.Pattern, str]] = [
+_MD_STRIP: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"#{1,6}\s*"),                    ""),     # headings
     (re.compile(r"\*\*(.+?)\*\*"),                r"\1"), # bold
     (re.compile(r"\*(.+?)\*"),                    r"\1"), # italic
@@ -294,7 +343,7 @@ def extract_verdict_label(verdict_text: str) -> str:
     return "UNKNOWN"
 
 
-def format_output(result: dict, fmt: OutputFormat = OutputFormat.MARKDOWN) -> "str | dict":
+def format_output(result: dict[str, Any], fmt: OutputFormat = OutputFormat.MARKDOWN) -> "str | dict[str, Any]":
     """
     Post-process a ``generate_moderation`` result.
 
@@ -330,15 +379,15 @@ class ReasoningMode(Enum):
     """
     Controls how much thinking the model does before emitting a verdict.
 
-    FLASH   – minimal chain-of-thought; fastest, best for obvious cases.
-    STANDARD– balanced reasoning; good general-purpose default.
-    DEEP    – extended deliberation; best for nuanced / borderline content.
-    EXPERT  – maximum tokens + lower temperature; use for high-stakes review.
+    NONE   – minimal chain-of-thought; fastest, best for obvious cases.
+    LOW    – balanced reasoning; good general-purpose default.
+    MEDIUM – extended deliberation; best for nuanced / borderline content.
+    HIGH   – maximum tokens + lower temperature; use for high-stakes review.
     """
-    FLASH    = "flash"
-    STANDARD = "standard"
-    DEEP     = "deep"
-    EXPERT   = "expert"
+    NONE   = "none"
+    LOW    = "low"
+    MEDIUM = "medium"
+    HIGH   = "high"
 
 
 # Injected into every system prompt to teach the model Markdown output style
@@ -367,7 +416,7 @@ class ReasoningConfig:
 
 
 REASONING_CONFIGS: dict[ReasoningMode, ReasoningConfig] = {
-    ReasoningMode.FLASH: ReasoningConfig(
+    ReasoningMode.NONE: ReasoningConfig(
         max_think_tokens=200,
         max_total_tokens=812,
         temperature=0.1,
@@ -378,7 +427,7 @@ REASONING_CONFIGS: dict[ReasoningMode, ReasoningConfig] = {
             + _MARKDOWN_INSTRUCTION
         ),
     ),
-    ReasoningMode.STANDARD: ReasoningConfig(
+    ReasoningMode.LOW: ReasoningConfig(
         max_think_tokens=512,
         max_total_tokens=1200,
         temperature=0.7,
@@ -389,7 +438,7 @@ REASONING_CONFIGS: dict[ReasoningMode, ReasoningConfig] = {
             + _MARKDOWN_INSTRUCTION
         ),
     ),
-    ReasoningMode.DEEP: ReasoningConfig(
+    ReasoningMode.MEDIUM: ReasoningConfig(
         max_think_tokens=1536,
         max_total_tokens=2048,
         temperature=0.6,
@@ -401,7 +450,7 @@ REASONING_CONFIGS: dict[ReasoningMode, ReasoningConfig] = {
             + _MARKDOWN_INSTRUCTION
         ),
     ),
-    ReasoningMode.EXPERT: ReasoningConfig(
+    ReasoningMode.HIGH: ReasoningConfig(
         max_think_tokens=3072,
         max_total_tokens=4096,
         temperature=0.4,
@@ -432,7 +481,67 @@ DATASET_JSON_PATH = Path(__file__).with_name("dataset.json")
 
 
 # ─────────────────────────────────────────────
-# RoPE
+# KV Cache
+# ─────────────────────────────────────────────
+@dataclass
+class KVCache:
+    """
+    Per-layer key/value cache for autoregressive generation.
+
+    Stores tensors of shape ``[B, n_head, T_cached, head_dim]``.
+    Grows incrementally as new tokens are generated.
+    """
+
+    key: Optional[torch.Tensor] = None
+    value: Optional[torch.Tensor] = None
+
+    @property
+    def seq_len(self) -> int:
+        """Number of tokens currently cached."""
+        if self.key is None:
+            return 0
+        return self.key.shape[2]
+
+    def update(
+        self, new_key: torch.Tensor, new_value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Append new K/V slices and return the full accumulated tensors.
+
+        Parameters
+        ----------
+        new_key, new_value : ``[B, n_head, T_new, head_dim]``
+
+        Returns
+        -------
+        (full_key, full_value) each ``[B, n_head, T_total, head_dim]``
+        """
+        if self.key is None or self.value is None:
+            self.key = new_key
+            self.value = new_value
+        else:
+            assert self.key is not None and self.value is not None
+            self.key = torch.cat((self.key, new_key), dim=2)
+            self.value = torch.cat((self.value, new_value), dim=2)
+
+        return cast(torch.Tensor, self.key), cast(torch.Tensor, self.value)
+
+    def clear(self) -> None:
+        self.key = None
+        self.value = None
+
+
+# Type alias: one KVCache per layer
+LayerCaches = list[KVCache]
+
+
+def make_kv_caches(n_layers: int) -> LayerCaches:
+    """Create a fresh list of empty KV caches, one per transformer layer."""
+    return [KVCache() for _ in range(n_layers)]
+
+
+# ─────────────────────────────────────────────
+# RoPE  (supports position offset for KV cache)
 # ─────────────────────────────────────────────
 class RoPE(nn.Module):
     def __init__(self, head_dim: int, max_seq_len: int = CONTEXT_LEN):
@@ -440,9 +549,21 @@ class RoPE(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, seq_len: int, device):
-        t     = torch.arange(seq_len, device=device).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+    def forward(
+        self, seq_len: int, device: torch.device, offset: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute cos/sin embeddings for positions ``[offset, offset+seq_len)``.
+
+        Parameters
+        ----------
+        seq_len : number of new positions to compute
+        device  : target device
+        offset  : starting position index (= number of previously cached tokens)
+        """
+        inv_freq = cast(torch.Tensor, self.inv_freq)
+        t: torch.Tensor = torch.arange(offset, offset + seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
         emb   = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None, :, None, :], emb.sin()[None, :, None, :]
 
@@ -459,88 +580,151 @@ def apply_rope(q, k, cos, sin):
 
 
 # ─────────────────────────────────────────────
-# Transformer Block
+# Transformer Block  (with KV cache + dropout)
 # ─────────────────────────────────────────────
 class GreesyBlock(nn.Module):
-    def __init__(self, n_embd: int, n_head: int):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head   = n_head
-        self.head_dim = n_embd // n_head
+        n_embd = config.n_embd
+        self.n_head   = config.n_head
+        self.head_dim = config.head_dim
 
         self.ln1      = nn.LayerNorm(n_embd)
         self.ln2      = nn.LayerNorm(n_embd)
         self.qkv      = nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.out_proj = nn.Linear(n_embd, n_embd, bias=False)
-        self.rope     = RoPE(self.head_dim)
-        self.mlp      = nn.Sequential(
+        self.rope     = RoPE(self.head_dim, max_seq_len=config.context_len)
+
+        # Dropout layers
+        self.attn_dropout  = nn.Dropout(config.attn_dropout)
+        self.resid_dropout = nn.Dropout(config.resid_dropout)
+
+        self.mlp = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.GELU(),
+            nn.Dropout(config.mlp_dropout),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(config.resid_dropout),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with optional KV caching.
+
+        Parameters
+        ----------
+        x        : ``[B, T, C]`` — input embeddings (full sequence or single new token)
+        kv_cache : if provided, keys/values are appended to the cache and the
+                   full cached K/V are used for attention, enabling O(1) per-token
+                   inference instead of O(T).
+        """
         B, T, C = x.shape
 
         norm_x = self.ln1(x)
         qkv    = self.qkv(norm_x).reshape(B, T, 3, self.n_head, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
-        cos, sin = self.rope(T, x.device)
+        # Position offset = number of tokens already in the cache
+        offset = kv_cache.seq_len if kv_cache is not None else 0
+        cos, sin = self.rope(T, x.device, offset=offset)
         q, k     = apply_rope(q, k, cos, sin)
 
-        # [B, T, n_head, head_dim] → [B, n_head, T, head_dim] for SDPA
+        # [B, T, n_head, head_dim] → [B, n_head, T, head_dim]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # scaled_dot_product_attention runs the best available kernel per device:
-        #   MPS  → Apple Metal efficient attention
-        #   CUDA → FlashAttention-2 (PyTorch ≥ 2.1) or math fallback
-        #   CPU  → math fallback
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Update KV cache (if provided) and use full cached K/V for attention
+        if kv_cache is not None:
+            k, v = kv_cache.update(k, v)
+
+        # Causal mask is only needed during training/prefill (offset==0).
+        # During cached single-token generation (offset>0, T_q=1) every
+        # cached position is visible, so is_causal=False is correct.
+        is_causal = kv_cache is None or offset == 0
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=is_causal,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+        )
 
         # [B, n_head, T, head_dim] → [B, T, C]
         attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
-        x = x + self.out_proj(attn_out)
+        x = x + self.resid_dropout(self.out_proj(attn_out))
         x = x + self.mlp(self.ln2(x))
         return x
 
 
 # ─────────────────────────────────────────────
-# Model
+# Model  (config-driven, with embedding dropout + KV cache support)
 # ─────────────────────────────────────────────
 class GreesyGPT(nn.Module):
-    def __init__(self):
+    def __init__(self, config: Optional[ModelConfig] = None):
         super().__init__()
-        self.tok_emb = nn.Embedding(VOCAB_SIZE, N_EMBD)
-        self.blocks  = nn.ModuleList([GreesyBlock(N_EMBD, N_HEAD) for _ in range(N_LAYER)])
-        self.ln_f    = nn.LayerNorm(N_EMBD)
-        self.head    = nn.Linear(N_EMBD, VOCAB_SIZE, bias=False)
+        self.config = config or DEFAULT_CONFIG
+        c = self.config
+
+        self.embd_dropout = nn.Dropout(c.embd_dropout)
+        self.tok_emb = nn.Embedding(c.vocab_size, c.n_embd)
+        self.blocks  = nn.ModuleList([GreesyBlock(c) for _ in range(c.n_layer)])
+        self.ln_f    = nn.LayerNorm(c.n_embd)
+        self.head    = nn.Linear(c.n_embd, c.vocab_size, bias=False)
         self.tok_emb.weight = self.head.weight  # weight tying
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        x = self.tok_emb(idx)
-        for block in self.blocks:
-            x = block(x)
+        n_params = sum(p.numel() for p in self.parameters())
+        logger.info(
+            "GreesyGPT initialised — %.2fM params, %d layers, %d heads, "
+            "ctx=%d, dropout=(attn=%.2f, resid=%.2f, embd=%.2f, mlp=%.2f)",
+            n_params / 1e6, c.n_layer, c.n_head, c.context_len,
+            c.attn_dropout, c.resid_dropout, c.embd_dropout, c.mlp_dropout,
+        )
+
+    def forward(
+        self,
+        idx: torch.Tensor,
+        kv_caches: Optional[LayerCaches] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        idx       : ``[B, T]`` token indices
+        kv_caches : optional list of ``KVCache`` (one per layer). When
+                    provided, enables incremental decoding.
+
+        Returns
+        -------
+        logits : ``[B, T, vocab_size]``
+        """
+        x = self.embd_dropout(self.tok_emb(idx))
+        for i, block in enumerate(self.blocks):
+            cache = kv_caches[i] if kv_caches is not None else None
+            x = block(x, kv_cache=cache)
         return self.head(self.ln_f(x))
 
 
 # ─────────────────────────────────────────────
-# Generation  (chat-template + reasoning-mode aware)
+# Generation  (KV-cached, chat-template + reasoning-mode aware)
 # ─────────────────────────────────────────────
+@torch.inference_mode()
 def generate_moderation(
     model: GreesyGPT,
     prompt: str,
-    mode: ReasoningMode = ReasoningMode.STANDARD,
+    mode: ReasoningMode = ReasoningMode.LOW,
     output_format: OutputFormat = OutputFormat.MARKDOWN,
     # Optional per-call overrides (take priority over mode defaults)
     max_tokens: Optional[int]   = None,
     temp:       Optional[float] = None,
     top_k:      Optional[int]   = None,
-) -> dict:
+    use_kv_cache: bool = True,
+) -> dict[str, Any]:
     """
-    Run moderation inference via the chat template.
+    Run moderation inference via the chat template with KV caching.
 
     Parameters
     ----------
@@ -551,6 +735,7 @@ def generate_moderation(
     max_tokens    : overrides mode's ``max_total_tokens``
     temp          : overrides mode's ``temperature``
     top_k         : overrides mode's ``top_k``
+    use_kv_cache  : if True (default), use KV caching for efficient generation
 
     Returns
     -------
@@ -573,19 +758,69 @@ def generate_moderation(
         user_message=prompt,
         system_prompt=cfg.system_prompt,
     )
-    idx = torch.tensor(
-        [tokenizer.encode(input_str, allowed_special="all")]
-    ).to(DEVICE)
+    tokens = tokenizer.encode(input_str, allowed_special="all")
+    context_len = model.config.context_len
 
     think_tokens = 0
     think_closed = False
 
-    with torch.no_grad():
+    if use_kv_cache:
+        # ── KV-cached generation ──────────────────────────────────────────
+        kv_caches = make_kv_caches(model.config.n_layer)
+        idx = torch.tensor([tokens], device=DEVICE)
+
+        # Truncate prompt if it exceeds context length
+        if idx.shape[1] > context_len:
+            idx = idx[:, -context_len:]
+            logger.warning("Prompt truncated to context_len=%d tokens", context_len)
+
+        # Prefill: process the entire prompt in one forward pass
+        logits = model(idx, kv_caches=kv_caches)
+
+        generated_ids: list[int] = []
+
         for _ in range(_max):
-            logits = model(idx[:, -CONTEXT_LEN:])
+            scaled_logits = logits[:, -1, :] / _temp
+
+            if not think_closed and think_tokens >= cfg.max_think_tokens:
+                next_id  = TOK_THINK_CLOSE
+                next_tok = torch.tensor([[next_id]], device=DEVICE)
+            else:
+                v, _    = torch.topk(scaled_logits, _topk)
+                scaled_logits[scaled_logits < v[:, [-1]]] = -float("Inf")
+                probs    = F.softmax(scaled_logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                next_id  = int(next_tok.item())
+
+            generated_ids.append(next_id)
+
+            if not think_closed:
+                if next_id == TOK_THINK_CLOSE:
+                    think_closed = True
+                else:
+                    think_tokens += 1
+
+            if next_id == TOK_EOT:
+                break
+
+            # Check context length limit
+            if kv_caches[0].seq_len >= context_len:
+                logger.warning("Reached context_len=%d during generation, stopping.", context_len)
+                break
+
+            # Single-token forward pass using cached K/V
+            logits = model(next_tok, kv_caches=kv_caches)
+
+        all_ids = tokens + generated_ids
+
+    else:
+        # ── Non-cached generation (legacy path) ──────────────────────────
+        idx = torch.tensor([tokens], device=DEVICE)
+
+        for _ in range(_max):
+            logits = model(idx[:, -context_len:])
             logits = logits[:, -1, :] / _temp
 
-            # Enforce think-token budget: force </think> when limit is reached
             if not think_closed and think_tokens >= cfg.max_think_tokens:
                 next_id  = TOK_THINK_CLOSE
                 next_tok = torch.tensor([[next_id]], device=idx.device)
@@ -594,7 +829,7 @@ def generate_moderation(
                 logits[logits < v[:, [-1]]] = -float("Inf")
                 probs    = F.softmax(logits, dim=-1)
                 next_tok = torch.multinomial(probs, num_samples=1)
-                next_id  = next_tok.item()
+                next_id  = int(next_tok.item())
 
             idx = torch.cat((idx, next_tok), dim=1)
 
@@ -607,7 +842,9 @@ def generate_moderation(
             if next_id == TOK_EOT:
                 break
 
-    full_text = tokenizer.decode(idx[0].tolist(), errors="replace")
+        all_ids = idx[0].tolist()
+
+    full_text = tokenizer.decode(all_ids, errors="replace")
 
     # ── Parse <think> block and verdict ──────────────────────────────────────
     thinking = verdict = None
@@ -617,13 +854,11 @@ def generate_moderation(
         thinking = full_text[ts:te].strip()
         verdict  = full_text[te + len("</think>"):].strip()
     else:
-        # Fallback: grab everything after <|assistant|>
         verdict = re.sub(r"^.*?<\|assistant\|>\s*", "", full_text, flags=re.DOTALL).strip()
 
-    # Strip any leading role tag artefacts
     verdict = re.sub(r"^<\|assistant\|>\s*", "", verdict).strip()
 
-    result = {
+    result: dict[str, Any] = {
         "full_text":     full_text,
         "thinking":      thinking,
         "verdict":       verdict,
@@ -637,7 +872,7 @@ def generate_moderation(
 # ─────────────────────────────────────────────
 # Sample Dataset  (Markdown-formatted reasoning)
 # ─────────────────────────────────────────────
-SAMPLE_MODERATION_DATA: list[dict] = [
+SAMPLE_MODERATION_DATA: list[dict[str, Any]] = [
     # ── SAFE ──────────────────────────────────────────────────────────────────
     {
         "instruction": "What's a good recipe for chocolate chip cookies?",
@@ -932,7 +1167,8 @@ def get_sample_dataset(
     )
 
 
-def load_dataset_json(file_path: Optional[str | Path] = None) -> list[dict]:
+def load_dataset_json(file_path: Optional[str | Path] = None) -> list[dict[str, Any]]:
+    """Load dataset from JSON file."""
     path = Path(file_path) if file_path is not None else DATASET_JSON_PATH
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -940,7 +1176,10 @@ def load_dataset_json(file_path: Optional[str | Path] = None) -> list[dict]:
     if not isinstance(data, list):
         raise ValueError("dataset.json must contain a list of samples")
 
-    normalized: list[dict] = []
+    # Decrease dataset to 1k as requested
+    data = data[:1000]
+
+    normalized: list[dict[str, Any]] = []
     for index, item in enumerate(data):
         if not isinstance(item, dict):
             raise ValueError(f"dataset.json item {index} must be an object")
@@ -990,7 +1229,7 @@ def get_dataset(
 # ─────────────────────────────────────────────
 # Dataset  (chat-template aware)
 # ─────────────────────────────────────────────
-class ModerationReasoningDataset(Dataset):
+class ModerationReasoningDataset(Dataset[dict[str, torch.Tensor]]):
     """
     Formats each sample as a three-turn chat via ``ChatTemplate``:
 
@@ -1010,7 +1249,7 @@ class ModerationReasoningDataset(Dataset):
 
     def __init__(
         self,
-        data_list: list[dict],
+        data_list: list[dict[str, Any]],
         enc: tiktoken.Encoding,
         max_length: int = 12288,
         system_prompt: str = "",
@@ -1038,7 +1277,7 @@ class ModerationReasoningDataset(Dataset):
         return ChatTemplate.tokenize(messages, self.enc, self.max_length)
 
 
-def collate_fn(batch: list[dict]) -> dict[str, torch.Tensor]:
+def collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     input_ids = pad_sequence(
         [b["input_ids"] for b in batch], batch_first=True, padding_value=TOK_EOT
     )
@@ -1055,7 +1294,7 @@ class GreesyTrainer:
     def __init__(
         self,
         model: GreesyGPT,
-        train_dataset: Dataset,
+        train_dataset: Dataset[dict[str, torch.Tensor]],
         lr: float = 2e-5,
         batch_size: int = 2,
         grad_accum: int = 4,
@@ -1111,12 +1350,16 @@ if __name__ == "__main__":
     print(f"Using device: {DEVICE}")
     print(describe_reasoning_modes())
     print()
-
     # ── Train on sample data ──────────────────────────────────────────────────
     model   = GreesyGPT()
     dataset = get_dataset() if DATASET_JSON_PATH.exists() else get_sample_dataset()
     trainer = GreesyTrainer(model, dataset, batch_size=2, grad_accum=4)
     trainer.train_epoch(epoch=1)
+
+    # ── Save the model ──────────────────────────────────────────────────
+    save_path = Path(__file__).parent / "greesy_gpt.pt"
+    torch.save(model.state_dict(), save_path)
+    print(f"Model saved to {save_path}")
 
     # ── Inference: compare modes × output formats ─────────────────────────────
     test_prompt = "You are worthless and no one will ever love you."
@@ -1129,21 +1372,3 @@ if __name__ == "__main__":
                 print(json.dumps(result["verdict_fmt"], indent=2))
             else:
                 print(str(result["verdict_fmt"])[:300])
-=======
-mport torch
-from torch import nn
-
-class GreesyGuard(nn.Module):
-    def __init__(self, vocab_size, embed_dim, hidden_dim, num_categories):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.classifier = nn.Linear(hidden_dim * 2, num_categories)
-
-    def forward(self, x):
-        embedded = self.embedding(x)
-        lstm_out, _ = self.lstm(embedded)
-        pooled = torch.mean(lstm_out, dim=1)
-        category_scores = self.classifier(pooled)
-        return category_scores
->>>>>>> 97e2c257c46cada50ce746fc505a1f8414a148e6
