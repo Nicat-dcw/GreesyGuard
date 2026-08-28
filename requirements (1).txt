@@ -1,0 +1,4 @@
+torch>=2.2
+tokenizers>=0.15
+datasets>=2.18
+tiktoken>=0.6   # only needed for --smoke_test
