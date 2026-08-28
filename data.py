@@ -6,8 +6,7 @@ Expects records shaped like the Hugging Face dataset used for Mini,
 example has (system prompt, user message, <think> reasoning, verdict).
 Records can come from a local JSONL file or be pulled from the Hub.
 
-Each record is rendered into the exact training format from the model
-card:
+Each record is rendered into the training format from the model card:
 
     <|system|>
     {system}
@@ -22,7 +21,14 @@ card:
     {reasoning}
     </think>
 
-    {verdict}<|endoftext|>
+    {final}<|endoftext|>
+
+`{final}` is whichever of these the record has (checked in order):
+`detailed_answer` (reasoning-then-answer data, no moderation label),
+`verdict` (Mini-style moderation output), or `label` (bare label
+fallback) — so this module works for both the moderation-verdict
+format and the label-free reasoning+answer format produced by
+`make_dataset.py`.
 
 Only tokens after `<|assistant|>` contribute to the loss — everything
 before that (system + user turns, and the `<|assistant|>` tag itself)
@@ -46,19 +52,38 @@ DEFAULT_SYSTEM_PROMPT = (
     "then give a final moderation verdict."
 )
 
+# System prompt to use for the label-free reasoning+answer format
+# (records that have `detailed_answer` instead of `verdict`/`label`).
+ANSWER_SYSTEM_PROMPT = (
+    "You are a careful reasoning assistant. Think step by step inside a "
+    "<think> block, then give a detailed, direct answer."
+)
 
-def render_example(record: Dict, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
-    system = record.get("system", system_prompt)
-    user_message = record["prompt"] if "prompt" in record else record["message"]
+
+def render_example(record: Dict, system_prompt: Optional[str] = None) -> str:
+    is_answer_format = "detailed_answer" in record
+    default_system = ANSWER_SYSTEM_PROMPT if is_answer_format else DEFAULT_SYSTEM_PROMPT
+    system = record.get("system", system_prompt or default_system)
+
+    user_message = (
+        record.get("prompt") or record.get("message") or record.get("instruction")
+    )
+    if user_message is None:
+        raise KeyError("record has none of: prompt, message, instruction")
+
     reasoning = record.get("think", record.get("reasoning", "")).strip()
-    verdict = record.get("verdict", record.get("label", "SAFE")).strip()
+    final = (
+        record.get("detailed_answer")
+        or record.get("verdict")
+        or record.get("label", "")
+    ).strip()
 
     return (
         f"<|system|>\n{system}\n</|system|>\n\n"
         f"<|user|>\n{user_message}\n</|user|>\n\n"
         f"<|assistant|>\n"
         f"<think>\n{reasoning}\n</think>\n\n"
-        f"{verdict}<|endoftext|>"
+        f"{final}<|endoftext|>"
     )
 
 
@@ -91,7 +116,7 @@ class ModerationDataset(Dataset):
         records: List[Dict],
         tokenizer,
         max_len: int = 32768,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: Optional[str] = None,
     ):
         self.tokenizer = tokenizer
         self.max_len = max_len
