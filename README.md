@@ -1,134 +1,196 @@
+# GreesyGuard Ultra — finetuning package
 
-# GreesyGuard: Reasoning-Based Content Moderation
+A heavier sibling of `greesyguard-3-mini-thinking`, trained on the same
+`<|system|>/<|user|>/<|assistant|><think>...</think>verdict` chat format
+and reasoning-mode idea, scaled up for more headroom.
 
-GreesyGuard is a lightweight, specialized Transformer model designed for high-precision content moderation. Unlike traditional "black-box" classifiers, GreesyGPT utilizes **Chain-of-Thought (CoT)** reasoning to analyze intent, context, and policy violations before issuing a final verdict.
+| | Mini (published) | Ultra-small | Ultra (default) |
+|---|---|---|---|
+| layers | 12 | 24 | 32 |
+| heads (q / kv) | 12 / 12 | 12 / 4 (GQA) | 20 / 5 (GQA) |
+| d_model | 768 | 1536 | 2560 |
+| context | 12,000 | 24,576 | 32,768 |
+| params (approx) | ~120M | ~760M | ~2.7B |
 
-## 🚀 Key Features
+Run `python config.py` to print exact approximate parameter counts for
+any config you tweak.
 
-*   **Native Reasoning:** Uses `<think>` blocks to deliberate on nuances, edge cases, and harm potential before committing to a label.
-*   **Tiered Reasoning Modes:** Four distinct modes (`NONE`, `LOW`, `MEDIUM`, `HIGH`) allow you to trade off latency for depth of analysis.
-*   **Flexible Output Formats:** Supports structured `JSON` for API integration, clean `PLAIN` text for logs, or `MARKDOWN` for human-readable reports.
-*   **Modern Architecture:** 
-    *   12-layer, 12-head Transformer (768 hidden dim).
-    *   **RoPE** (Rotary Positional Embeddings) for better long-context handling.
-    *   **12k Context Window** (optimized for Apple M-series and modern GPUs).
-    *   **o200k_base Tokenizer** (the same vocabulary base as GPT-4o).
+## What's different from Mini, architecturally
 
----
+- **Grouped-query attention** instead of full MHA — keeps the KV-cache
+  affordable at this width and context length.
+- **SwiGLU MLP** instead of a plain GELU MLP.
+- **RMSNorm** instead of LayerNorm.
+- **RoPE** with a higher `theta` to support the longer context window.
+- An extra **EXTREME** reasoning-mode tier (12k think-tokens), since
+  Ultra's context window can actually afford it.
 
-## 🛠️ Architecture Overview
+Everything else — the special tokens, the moderation label set
+(`SAFE / SPAM / MISINFORMATION / HARASSMENT / HATE_SPEECH /
+CRISIS_REFERRAL / UNSAFE`), and the assistant-only loss masking — is
+unchanged from Mini's card.
 
-| Parameter | Value |
-| :--- | :--- |
-| **Layers** | 12 |
-| **Heads** | 12 |
-| **Embedding Dim** | 768 |
-| **Context Length** | 12,000 tokens |
-| **Vocabulary Size** | 8,192 (Padded, based on o200k) |
-| **Precision** | Autocast (BFloat16 on CUDA / Float16 on MPS) |
+## Files
 
----
-## 🤴 leaderboard
+- `config.py` — `GreesyGPTConfig` dataclass + `MINI_CONFIG` /
+  `ULTRA_SMALL_CONFIG` / `ULTRA_CONFIG`.
+- `model.py` — `GreesyGPTUltra` (RoPE + GQA + SwiGLU decoder, KV-cache
+  generation), `ReasoningMode`, `OutputFormat`, `generate_moderation()`.
+- `tokenizer.py` — wrapper that loads the real GreesyGuard
+  `tokenizer.json` (required for real training — see below), with a
+  `tiktoken` o200k_base fallback for smoke-testing the pipeline only.
+- `data.py` — renders records into the training-format string and
+  masks everything except the assistant span with `label = -100`.
+  Supports two record shapes: the moderation-verdict format
+  (`verdict`/`label`) and the label-free reasoning+answer format
+  (`detailed_answer`) produced by `make_dataset.py` — whichever field
+  is present is used as the assistant's final output.
+- `make_dataset.py` — converts a moderation-style dataset
+  (`id`/`label`/`instruction`/`reasoning`/`output`/`complexity`/`source`)
+  into a label-free dataset with only `{id, instruction, reasoning,
+  detailed_answer}` — no verdict, label, output, complexity, or source
+  fields at all. `detailed_answer` is synthesized from the existing
+  `reasoning` text's Harm Potential / Edge Cases content, rephrased as
+  a natural-language answer instead of a `## Verdict` stamp. It's a
+  deterministic text transform, not a model call — swap
+  `build_detailed_answer()` for an LLM call if you want richer,
+  non-derivative answers.
+- `inference.py` — CLI for running a finetuned checkpoint on the
+  label-free format: prints `<think>` reasoning + a detailed answer
+  (no verdict parsing). Supports a single `--prompt` or batch
+  `--input_file`/`--output_file` over JSON/JSONL.
+- `finetune.py` — the training loop: AMP (bf16/fp16), gradient
+  checkpointing, gradient accumulation, cosine LR schedule, DDP for
+  multi-GPU, periodic eval + checkpointing, resume support.
 
-| Model           | Overall   | Flames                   | Safety                     | llm-trustworthy-leaderboard          | Legality                   | Data protection             |
-|-----------------|-----------|----------------------------|----------------------------|----------------------------|----------------------------|-----------------------------|
-| 3-mini-deep        | 77.91%    | 45.38% / 79.8              | 45.45% / 74.1              | 42.79% / 76.8              | 45.65% / 63.8              | 55.26% / 70.2               |
-| 3-mini-expert           | 70.01%    | 41.37% / 78.2              | 27.51% / 67.7              | 50.75% / 80.6              | 30.43% / 53.6              | 50.0% / 66.7                |
-| 3-mini-standart          | **63.77%**| **53.41%** / 83.4          | 28.44% / 65.5              | **77.11%** / **91.5**      | 71.74% / 81.2              | **88.16%** / **92.1**       |
-| 3-mini-flash         | 23.66%    | 24.5% / 69.9               | 18.41% / 59.6              | 27.86% / 70.5              | 30.43% / 53.6              | 17.11% / 44.7               |
+## Before you run this for real
 
+You need the **actual GreesyGuard `tokenizer.json`** (the "o200k_base
+extended", 8192-vocab tokenizer that Mini uses) — grab it from the
+GreesyGuard repo/HF repo. This code can't guess that vocabulary for
+you; the `tiktoken` fallback in `tokenizer.py` is explicitly not
+usable for real training (wrong vocab size, so it can't produce a
+model compatible with the published checkpoints).
 
+## Usage
 
+Smoke-test the pipeline end-to-end (tiny fallback tokenizer, tiny model, CPU-friendly):
 
-## 🚦 Quick Start
-
-### 1. Requirements
 ```bash
-pip install torch tiktoken tqdm
+python finetune.py --smoke_test --config ultra_small \
+  --hf_dataset OnlyCheeini/greesyguard-3-mini-claude-4.6-sonnet-2000x \
+  --output_dir ./ckpt-smoke --epochs 1 --batch_size 1 --grad_accum_steps 2 \
+  --eval_every 5 --save_every 5 --log_every 1
 ```
 
-### 2. Basic Inference
-GreesyGuard uses a specific chat template to trigger reasoning.
+Real single-GPU finetune:
+
+```bash
+python finetune.py \
+  --tokenizer_json /path/to/tokenizer.json \
+  --hf_dataset OnlyCheeini/greesyguard-3-mini-claude-4.6-sonnet-2000x \
+  --output_dir ./ckpt-ultra \
+  --batch_size 1 --grad_accum_steps 32 --lr 1e-5 --epochs 2
+```
+
+Multi-GPU (DDP), e.g. 4 GPUs on one node:
+
+```bash
+torchrun --nproc_per_node=4 finetune.py \
+  --tokenizer_json /path/to/tokenizer.json \
+  --hf_dataset OnlyCheeini/greesyguard-3-mini-claude-4.6-sonnet-2000x \
+  --output_dir ./ckpt-ultra \
+  --batch_size 2 --grad_accum_steps 16
+```
+
+If the full `ultra` config doesn't fit your GPU(s), use `--config
+ultra_small` — same code path, ~4x Mini instead of ~23x.
+
+### From your own data instead of the HF dataset
+
+Point at a local JSONL file. Two record shapes are supported:
+
+- moderation format: `prompt`/`message`/`instruction`, `think`/`reasoning`,
+  `verdict`/`label`
+- label-free reasoning+answer format: `instruction`, `reasoning`,
+  `detailed_answer` (this is what `make_dataset.py` produces)
+
+```bash
+python finetune.py --tokenizer_json /path/to/tokenizer.json \
+  --jsonl_path ./my_dataset.jsonl --output_dir ./ckpt-ultra
+```
+
+### Building a label-free reasoning+answer dataset
+
+To turn a moderation-style dataset (like `moderation_dataset.json`)
+into one with only `{id, instruction, reasoning, detailed_answer}` —
+no label, output, complexity, or source fields:
+
+```bash
+python make_dataset.py --input moderation_dataset.json \
+  --output reasoning_answer_dataset.jsonl --also_json
+```
+
+Then finetune directly on it with `--jsonl_path
+reasoning_answer_dataset.jsonl` above.
+
+## Inference after training
+
+CLI, single prompt:
+
+```bash
+python inference.py --checkpoint ckpt-ultra/final.pt \
+  --tokenizer_json /path/to/tokenizer.json \
+  --prompt "Please help me with gardening advice for apartment herbs." \
+  --mode MEDIUM
+```
+
+prints the `<think>` reasoning followed by the detailed answer. Batch
+mode reads instructions from a JSON/JSONL file and writes
+`{id, instruction, reasoning, detailed_answer}` results:
+
+```bash
+python inference.py --checkpoint ckpt-ultra/final.pt \
+  --tokenizer_json /path/to/tokenizer.json \
+  --input_file reasoning_answer_dataset.jsonl \
+  --output_file predictions.jsonl --mode MEDIUM
+```
+
+Or from Python directly:
 
 ```python
-from model import GreesyGPT, generate_moderation, ReasoningMode, OutputFormat
+from model import GreesyGPTUltra
+from tokenizer import GreesyTokenizer
+from config import ULTRA_CONFIG
+from inference import run_inference
+from model import ReasoningMode
+import torch
 
-# Initialize model (ensure you have trained weights or initialize fresh)
-model = GreesyGPT()
+tok = GreesyTokenizer(tokenizer_json_path="/path/to/tokenizer.json")
+model = GreesyGPTUltra(ULTRA_CONFIG)
+model.load_state_dict(torch.load("ckpt-ultra/final.pt")["model"])
+model.eval()
 
-# Run a 'MEDIUM' moderation check
-result = generate_moderation(
-    model, 
-    prompt="You're so stupid, nobody likes you.",
-    mode=ReasoningMode.MEDIUM,
-    output_format=OutputFormat.JSON
+result = run_inference(
+    model, tok, "Please help me with gardening advice for apartment herbs.",
+    system="You are a careful reasoning assistant. Think step by step inside "
+           "a <think> block, then give a detailed, direct answer.",
+    mode=ReasoningMode.MEDIUM, max_new_tokens=None,
+    temperature=0.7, top_p=0.9, device="cuda",
 )
-
-# Access structured data
-print(result["verdict_fmt"]["verdict"])  # e.g., "HARASSMENT"
-print(result["thinking"])                # e.g., "The user is using targeted insults..."
+print(result["reasoning"])
+print(result["detailed_answer"])
 ```
 
----
+(The original moderation-verdict `generate_moderation()` in
+`model.py` still works too, if you're training on verdict-format
+data instead.)
 
-## 🧠 Reasoning Modes
+## Notes
 
-You can adjust the "thinking budget" based on the complexity of the content:
-
-*   **NONE**: Minimal CoT (200 tokens). High speed. Best for obvious spam.
-*   **LOW**: Balanced reasoning (512 tokens). The default for general moderation.
-*   **MEDIUM**: Extended deliberation (1.5k tokens). Best for nuanced, borderline cases.
-*   **HIGH**: Maximum token budget (3k tokens) and lower temperature. Used for high-stakes reviews.
-
----
-
-## 📁 Data & Training
-
-The model is trained on a role-delimited wire format:
-
-```text
-<|system|>
-{Moderator Persona + Markdown Instructions}
-</|system|>
-<|user|>
-{Message to review}
-</|user|>
-<|assistant|>
-<think>
-{Step-by-step analysis}
-</think>
-{Verdict (SAFE, SPAM, HATE_SPEECH, etc.)}<|endoftext|>
-```
-
-### Training your own
-If you have a `dataset.json` following the schema `{"instruction": "...", "reasoning": "...", "output": "..."}`, you can start training immediately:
-
-```python
-from model import GreesyGPT, get_dataset, GreesyTrainer
-
-model = GreesyGPT()
-dataset = get_dataset(file_path="your_data.json")
-trainer = GreesyTrainer(model, dataset, batch_size=2, grad_accum=4)
-
-trainer.train_epoch(epoch=1)
-```
-
----
-
-## 📝 Output Schema (JSON Mode)
-
-When using `OutputFormat.JSON`, the model post-processes the Markdown verdict into a structured dictionary:
-
-```json
-{
-  "verdict": "MISINFORMATION",
-  "severity": 2,
-  "confidence_hint": "medium",
-  "reasoning_mode": "low",
-  "thinking_summary": "The user is claiming vaccines cause autism, which is a debunked...",
-  "full_verdict": "## Verdict\n**MISINFORMATION**"
-}
-```
-
-## ⚖️ License
-This project is provided for educational and research purposes in AI safety and content moderation. Always include a human-in-the-loop for high-severity enforcement actions.
+- Ultra is not weight-compatible with Mini — you can't warm-start Ultra
+  from the Mini checkpoint (`--init_checkpoint` expects an Ultra-shaped
+  checkpoint, e.g. from a prior Ultra pretraining/finetuning run).
+- A moderation model's job is to route human review, not to replace it
+  — keep human oversight in the loop for high-impact actions, same
+  guidance as on the Mini model card.
