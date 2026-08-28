@@ -41,6 +41,24 @@ unchanged from Mini's card.
   `tiktoken` o200k_base fallback for smoke-testing the pipeline only.
 - `data.py` — renders records into the training-format string and
   masks everything except the assistant span with `label = -100`.
+  Supports two record shapes: the moderation-verdict format
+  (`verdict`/`label`) and the label-free reasoning+answer format
+  (`detailed_answer`) produced by `make_dataset.py` — whichever field
+  is present is used as the assistant's final output.
+- `make_dataset.py` — converts a moderation-style dataset
+  (`id`/`label`/`instruction`/`reasoning`/`output`/`complexity`/`source`)
+  into a label-free dataset with only `{id, instruction, reasoning,
+  detailed_answer}` — no verdict, label, output, complexity, or source
+  fields at all. `detailed_answer` is synthesized from the existing
+  `reasoning` text's Harm Potential / Edge Cases content, rephrased as
+  a natural-language answer instead of a `## Verdict` stamp. It's a
+  deterministic text transform, not a model call — swap
+  `build_detailed_answer()` for an LLM call if you want richer,
+  non-derivative answers.
+- `inference.py` — CLI for running a finetuned checkpoint on the
+  label-free format: prints `<think>` reasoning + a detailed answer
+  (no verdict parsing). Supports a single `--prompt` or batch
+  `--input_file`/`--output_file` over JSON/JSONL.
 - `finetune.py` — the training loop: AMP (bf16/fp16), gradient
   checkpointing, gradient accumulation, cosine LR schedule, DDP for
   multi-GPU, periodic eval + checkpointing, resume support.
@@ -90,21 +108,62 @@ ultra_small` — same code path, ~4x Mini instead of ~23x.
 
 ### From your own data instead of the HF dataset
 
-Point at a local JSONL file where each line has `prompt` (the message
-to review), `think` (the reasoning), and `verdict` (one of the
-moderation labels), optionally `system`:
+Point at a local JSONL file. Two record shapes are supported:
+
+- moderation format: `prompt`/`message`/`instruction`, `think`/`reasoning`,
+  `verdict`/`label`
+- label-free reasoning+answer format: `instruction`, `reasoning`,
+  `detailed_answer` (this is what `make_dataset.py` produces)
 
 ```bash
 python finetune.py --tokenizer_json /path/to/tokenizer.json \
-  --jsonl_path ./my_moderation_data.jsonl --output_dir ./ckpt-ultra
+  --jsonl_path ./my_dataset.jsonl --output_dir ./ckpt-ultra
 ```
+
+### Building a label-free reasoning+answer dataset
+
+To turn a moderation-style dataset (like `moderation_dataset.json`)
+into one with only `{id, instruction, reasoning, detailed_answer}` —
+no label, output, complexity, or source fields:
+
+```bash
+python make_dataset.py --input moderation_dataset.json \
+  --output reasoning_answer_dataset.jsonl --also_json
+```
+
+Then finetune directly on it with `--jsonl_path
+reasoning_answer_dataset.jsonl` above.
 
 ## Inference after training
 
+CLI, single prompt:
+
+```bash
+python inference.py --checkpoint ckpt-ultra/final.pt \
+  --tokenizer_json /path/to/tokenizer.json \
+  --prompt "Please help me with gardening advice for apartment herbs." \
+  --mode MEDIUM
+```
+
+prints the `<think>` reasoning followed by the detailed answer. Batch
+mode reads instructions from a JSON/JSONL file and writes
+`{id, instruction, reasoning, detailed_answer}` results:
+
+```bash
+python inference.py --checkpoint ckpt-ultra/final.pt \
+  --tokenizer_json /path/to/tokenizer.json \
+  --input_file reasoning_answer_dataset.jsonl \
+  --output_file predictions.jsonl --mode MEDIUM
+```
+
+Or from Python directly:
+
 ```python
-from model import GreesyGPTUltra, ReasoningMode, OutputFormat, generate_moderation
+from model import GreesyGPTUltra
 from tokenizer import GreesyTokenizer
 from config import ULTRA_CONFIG
+from inference import run_inference
+from model import ReasoningMode
 import torch
 
 tok = GreesyTokenizer(tokenizer_json_path="/path/to/tokenizer.json")
@@ -112,12 +171,20 @@ model = GreesyGPTUltra(ULTRA_CONFIG)
 model.load_state_dict(torch.load("ckpt-ultra/final.pt")["model"])
 model.eval()
 
-result = generate_moderation(
-    model, tok, prompt="You're worthless and nobody likes you.",
-    mode=ReasoningMode.MEDIUM, output_format=OutputFormat.JSON,
+result = run_inference(
+    model, tok, "Please help me with gardening advice for apartment herbs.",
+    system="You are a careful reasoning assistant. Think step by step inside "
+           "a <think> block, then give a detailed, direct answer.",
+    mode=ReasoningMode.MEDIUM, max_new_tokens=None,
+    temperature=0.7, top_p=0.9, device="cuda",
 )
-print(result["verdict_fmt"])
+print(result["reasoning"])
+print(result["detailed_answer"])
 ```
+
+(The original moderation-verdict `generate_moderation()` in
+`model.py` still works too, if you're training on verdict-format
+data instead.)
 
 ## Notes
 
